@@ -1,0 +1,21 @@
+[Unit]
+Description=FoodStock Reels Editor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/foodstock-reels
+EnvironmentFile=/etc/foodstock-reels.env
+Environment=REELS_EDITOR_HOST=0.0.0.0
+Environment=REELS_EDITOR_PORT=8091
+Environment=REELS_RENDER_DISABLED=1
+Environment=REELS_TRANSCRIBE_DISABLED=1
+ExecStart=/opt/foodstock-reels/.venv/bin/python /opt/foodstock-reels/server.py
+Restart=on-failure
+RestartSec=5
+Nice=15
+CPUQuota=60%
+
+[Install]
+WantedBy=multi-user.target
