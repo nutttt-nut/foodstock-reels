@@ -63,6 +63,10 @@ def push_json(name, filename, value):
     try: run(["rclone", "copyto", path, f"{INBOX}/{name}/{filename}"])
     finally: Path(path).unlink(missing_ok=True)
 
+def refresh_staged_json(name, folder):
+    for filename in ("clip.json", "transcript.json"):
+        run(["rclone", "copyto", f"{INBOX}/{name}/{filename}", str(folder / filename)])
+
 def list_clip_outputs():
     result = subprocess.run(["rclone", "lsjson", "--files-only", DRIVE_OUT], capture_output=True, text=True)
     return json.loads(result.stdout or "[]") if result.returncode == 0 else []
@@ -212,7 +216,7 @@ def transcribe(name):
     if TRANSCRIBE_DISABLED: return jsonify(error="transcribe ทำบน Mac"), 501
     def task(log):
         folder = stage(name); log("กำลังถอดเสียง", 20); run(["npx", "hyperframes", "transcribe", str(folder / "source.mp4")]); log("ถอดเสียงเสร็จ รอ review", 80)
-        meta = json.loads((folder / "clip.json").read_text()); meta["reviewed"] = False; json_write(folder / "clip.json", meta)
+        meta = remote_json(name, "clip.json") or {}; meta["reviewed"] = False
         run(["rclone", "copy", str(folder / "transcript.json"), f"{INBOX}/{name}/"]); push_json(name, "clip.json", meta)
     return jsonify(job_id=set_job(name, task)), 202
 
@@ -258,7 +262,7 @@ def render(name):
     info = rendered_info(name, include_next=True)
     if not info["reviewed"]: return jsonify(error="Review transcript before rendering"), 409
     def task(log):
-        folder = stage(name); log("กำลังสร้าง reel", 15); run(["python3", "make_clip.py", str(folder)]); log("กำลัง render", 35)
+        folder = stage(name); refresh_staged_json(name, folder); log("กำลังสร้าง reel", 15); run(["python3", "make_clip.py", str(folder)]); log("กำลัง render", 35)
         output = OUT / info["_next_output"]
         run(["npx", "hyperframes", "render", str(folder), "--output", str(output)]); log("กำลังอัปโหลด Drive", 85); run(["rclone", "copy", str(output), DRIVE_OUT]); shutil.rmtree(folder, ignore_errors=True); output.unlink(missing_ok=True)
     return jsonify(job_id=set_job(name, task)), 202
