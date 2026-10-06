@@ -28,6 +28,8 @@ python server.py            # editor at http://127.0.0.1:8091
 
 ตัว launcher สร้าง rclone alias `localreels:` ให้อัตโนมัติ และเปิด transcribe/render ที่ `http://127.0.0.1:8091` โดยไม่ใช้ token. ต้องมี rclone, Node.js 22+, HyperFrames และ `ffprobe`.
 
+เปิดจากเครื่องอื่นใน Tailscale (เช่น MBA): `./scripts/start-local.sh --tailscale` จะ bind ที่ Tailscale IP ของ Mac เครื่องนี้ แล้วเปิด `http://<tailscale-ip>:8091` จากเครื่องอื่นใน tailnet ได้ (เข้าจาก internet/LAN ไม่ได้; ไฟล์และการ render ยังอยู่บน Mac เครื่องนี้ จึงต้องเปิดเครื่องไว้). ห้าม bind `0.0.0.0` เพราะโหมดนี้ไม่มี token.
+
 กลับไปใช้ Drive ได้ด้วย `RCLONE_REMOTE=gdrive ./scripts/start-local.sh` (ต้องตั้งค่า remote `gdrive:` ไว้ก่อน); launcher จะใช้ `FoodStockReels/inbox` และ `FoodStockReels/out` บน Drive. ปุ่ม Import จาก Drive link ใช้ได้เมื่อมี `gdrive:` เท่านั้น.
 
 การ deploy ไป VPS เป็น legacy; Phase 1 ทำงานบน Mac.
