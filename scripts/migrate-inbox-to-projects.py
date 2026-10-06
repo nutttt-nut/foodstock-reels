@@ -11,6 +11,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from make_clip import cues, trim_cues, probe
 project_locks, project_locks_guard = {}, threading.Lock()
 
+def video_dimensions(stream):
+    width, height = int(stream["width"]), int(stream["height"])
+    rotation = next((item.get("rotation") for item in stream.get("side_data_list", []) if item.get("rotation") is not None), None)
+    if rotation is None: rotation = stream.get("tags", {}).get("rotate")
+    try:
+        if abs(float(rotation)) % 180 == 90: width, height = height, width
+    except (TypeError, ValueError): pass
+    return width, height
+
 def run(args): return subprocess.run(args, capture_output=True, text=True, check=True).stdout
 
 def safe_slug(name):
@@ -54,10 +63,11 @@ def main():
             shutil.copy2(source, folder / "sources" / "s1.mp4")
             run(["ffmpeg", "-y", "-ss", "1", "-i", str(folder / "sources" / "s1.mp4"), "-frames:v", "1", "-q:v", "2", str(folder / "thumbs" / "s1.jpg")])
             try:
-                probe_data = json.loads(run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "json", str(folder / "sources" / "s1.mp4")])); stream = probe_data["streams"][0]
-            except (subprocess.CalledProcessError, KeyError, IndexError): stream = {"width": None, "height": None}
+                probe_data = json.loads(run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height:stream_tags=rotate:stream_side_data=rotation", "-of", "json", str(folder / "sources" / "s1.mp4")])); stream = probe_data["streams"][0]
+                width, height = video_dimensions(stream)
+            except (subprocess.CalledProcessError, KeyError, IndexError): width, height = None, None
             now = datetime.now(timezone.utc).isoformat()
-            project = {"name": name, "restaurant": meta.get("restaurant", name), "platform": "ig_reels", "target_seconds": 30, "prompt": "", "sources": [{"id": "s1", "file": "sources/s1.mp4", "duration": round(duration, 3), "width": stream.get("width"), "height": stream.get("height"), "thumb": "thumbs/s1.jpg", "original_name": "source.mp4"}], "scenes": [{"id": "sc1", "source": "s1", "in": round(start, 3), "out": round(end, 3), "locked": False, "reason": "", "subtitles": [dict(x, origin="whisper") for x in subtitles]}], "status": "ready" if meta.get("reviewed") is True else "draft", "rev": 1, "created_at": now, "updated_at": now, "migrated_from": name}
+            project = {"name": name, "restaurant": meta.get("restaurant", name), "platform": "ig_reels", "target_seconds": 30, "prompt": "", "sources": [{"id": "s1", "file": "sources/s1.mp4", "duration": round(duration, 3), "width": width, "height": height, "thumb": "thumbs/s1.jpg", "original_name": "source.mp4"}], "scenes": [{"id": "sc1", "source": "s1", "in": round(start, 3), "out": round(end, 3), "locked": False, "reason": "", "subtitles": [dict(x, origin="whisper") for x in subtitles]}], "status": "ready" if meta.get("reviewed") is True else "draft", "rev": 1, "created_at": now, "updated_at": now, "migrated_from": name}
             with project_lock(slug):
                 tmp_json = folder / ".project.json.tmp"
                 tmp_json.write_text(json.dumps(project, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"); os.replace(tmp_json, folder / "project.json")

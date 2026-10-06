@@ -175,6 +175,15 @@ def project_error(project):
             if not (0 <= a <= b <= end - start): return f"{field}.subtitles[{j}]: times must be inside scene length"
     return None
 
+def video_dimensions(stream):
+    width, height = int(stream["width"]), int(stream["height"])
+    rotation = next((item.get("rotation") for item in stream.get("side_data_list", []) if item.get("rotation") is not None), None)
+    if rotation is None: rotation = stream.get("tags", {}).get("rotate")
+    try:
+        if abs(float(rotation)) % 180 == 90: width, height = height, width
+    except (TypeError, ValueError): pass
+    return width, height
+
 def project_summary(slug, p):
     sources = p.get("sources", []); thumb = sources[0].get("thumb") if sources else None
     thumb_name = Path(thumb).name if thumb else None
@@ -278,11 +287,12 @@ def add_project_sources(slug):
                 nums += [int(re.search(r"\d+", x["id"]).group()) for x in staged]
                 sid = f"s{max(nums, default=0)+1}"
                 dst = folder / "sources" / f"{sid}{ext}"; upload.save(dst); created_paths.append(dst)
-                probe = json.loads(run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "format=duration:stream=width,height", "-of", "json", str(dst)]).stdout)
+                probe = json.loads(run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "format=duration:stream=width,height:stream_tags=rotate:stream_side_data=rotation", "-of", "json", str(dst)]).stdout)
                 stream = next(x for x in probe.get("streams", []) if x.get("width") and x.get("height"))
+                width, height = video_dimensions(stream)
                 duration = float(probe["format"]["duration"]); thumb_rel = f"thumbs/{sid}.jpg"
                 thumb_path = folder / thumb_rel; run(["ffmpeg", "-y", "-ss", "1", "-i", str(dst), "-frames:v", "1", "-q:v", "2", str(thumb_path)]); created_paths.append(thumb_path)
-                staged.append({"id": sid, "file": f"sources/{sid}{ext}", "duration": round(duration, 3), "width": int(stream["width"]), "height": int(stream["height"]), "thumb": thumb_rel, "original_name": original})
+                staged.append({"id": sid, "file": f"sources/{sid}{ext}", "duration": round(duration, 3), "width": width, "height": height, "thumb": thumb_rel, "original_name": original})
             p["sources"].extend(staged); p["rev"] += 1; p["updated_at"] = datetime.now(timezone.utc).isoformat(); write_project(folder, p)
         except (ValueError, KeyError, StopIteration, subprocess.CalledProcessError, json.JSONDecodeError) as exc:
             for path in created_paths:
