@@ -15,6 +15,7 @@ RENDER_DISABLED = os.environ.get("REELS_RENDER_DISABLED", "0") == "1"
 TRANSCRIBE_DISABLED = os.environ.get("REELS_TRANSCRIBE_DISABLED", "0") == "1"
 MAX_TRIM = float(os.environ.get("REELS_MAX_TRIM", "30"))
 jobs, jobs_lock = {}, threading.Lock()
+stage_locks, stage_locks_lock = {}, threading.Lock()
 app = Flask(__name__, static_folder=None)
 
 def authorized():
@@ -46,28 +47,58 @@ def drive_size(path):
     try: return int(result.stdout.splitlines()[0].strip())
     except ValueError: return None
 
-def drive_json(path):
-    result = subprocess.run(["rclone", "cat", path], capture_output=True, text=True)
-    if result.returncode: return {}
+def has_remote(name):
+    result = subprocess.run(["rclone", "listremotes"], capture_output=True, text=True)
+    return result.returncode == 0 and f"{name}:" in result.stdout.splitlines()
+
+def remote_json(name, filename):
+    result = subprocess.run(["rclone", "cat", f"{INBOX}/{name}/{filename}"], capture_output=True, text=True)
+    if result.returncode: return None
     try: return json.loads(result.stdout)
-    except json.JSONDecodeError: return {}
+    except json.JSONDecodeError: return None
+
+def push_json(name, filename, value):
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".json", delete=False) as f:
+        json.dump(value, f, ensure_ascii=False, indent=2); f.write("\n"); path = f.name
+    try: run(["rclone", "copyto", path, f"{INBOX}/{name}/{filename}"])
+    finally: Path(path).unlink(missing_ok=True)
+
+def list_clip_outputs():
+    result = subprocess.run(["rclone", "lsjson", "--files-only", DRIVE_OUT], capture_output=True, text=True)
+    return json.loads(result.stdout or "[]") if result.returncode == 0 else []
+
+def rendered_info(name, include_next=False):
+    files = json.loads(run(["rclone", "lsjson", "-R", "--files-only", INBOX]).stdout or "[]")
+    clip_files = {}
+    for item in files:
+        path = item.get("Path", ""); clip, _, filename = path.partition("/")
+        if clip == name: clip_files[filename] = item
+    meta = remote_json(name, "clip.json") or {}
+    outputs = list_clip_outputs()
+    info = clip_info(name, clip_files, meta, outputs)
+    versions = [int(m.group(1)) for item in outputs if (m := re.fullmatch(re.escape(name) + r"-v(\d+)-\d{4}-\d{2}-\d{2}\.mp4", item.get("Name", "")))]
+    if include_next: info["_next_output"] = f"{name}-v{max(versions, default=0)+1}-{__import__('datetime').date.today().isoformat()}.mp4"
+    return info
 
 def stage(name):
-    folder = CLIPS / name
-    remote_source = drive_size(f"{INBOX}/{name}/source.mp4")
-    local_source = folder / "source.mp4"
-    if not local_source.exists() or (remote_source is not None and local_source.stat().st_size != remote_source):
-        if folder.exists(): shutil.rmtree(folder)
-        folder.mkdir(parents=True, exist_ok=True)
-        run(["rclone", "copy", f"{INBOX}/{name}/", str(folder)])
-    return folder
+    with stage_locks_lock: lock = stage_locks.setdefault(name, threading.Lock())
+    with lock:
+        folder = CLIPS / name
+        remote_source = drive_size(f"{INBOX}/{name}/source.mp4")
+        local_source = folder / "source.mp4"
+        if not local_source.exists() or (remote_source is not None and local_source.stat().st_size != remote_source):
+            if folder.exists(): shutil.rmtree(folder)
+            folder.mkdir(parents=True, exist_ok=True)
+            run(["rclone", "copy", f"{INBOX}/{name}/", str(folder)])
+        return folder
 
-def clip_info(name):
-    files = set(drive_lines(f"{INBOX}/{name}"))
-    meta = drive_json(f"{INBOX}/{name}/clip.json")
+def clip_info(name, files, meta, outputs):
     reviewed = meta.get("reviewed") is True
-    out_name = f"{name}-v1-{__import__('datetime').date.today().isoformat()}.mp4"
-    rendered = out_name in set(drive_lines(DRIVE_OUT))
+    matches = sorted(((int(m.group(1)), item["Name"], item.get("ModTime", "")) for item in outputs
+                      if (m := re.fullmatch(re.escape(name) + r"-v(\d+)-\d{4}-\d{2}-\d{2}\.mp4", item.get("Name", "")))), reverse=True)
+    out_name, out_time = (matches[0][1], matches[0][2]) if matches else (None, "")
+    input_times = [item.get("ModTime", "") for item in files.values() if item.get("Name") in ("clip.json", "transcript.json")]
+    rendered = bool(out_name and out_time and len(input_times) == 2 and all(t and out_time > t for t in input_times))
     if rendered: status = "RENDERED"
     elif reviewed: status = "READY"
     elif "transcript.json" in files: status = "TRANSCRIBED"
@@ -99,6 +130,9 @@ def json_write(path, value):
 @app.get("/")
 def index(): return send_from_directory(ROOT, "editor.html")
 
+@app.get("/api/config")
+def config(): return jsonify(drive_import=has_remote("gdrive"), remote=REMOTE)
+
 @app.get("/fonts/<path:name>")
 def fonts(name): return send_from_directory(ROOT / "fonts", name)
 
@@ -107,7 +141,21 @@ def brand(name): return send_from_directory(ROOT / "brand", name)
 
 @app.get("/api/clips")
 @require_auth
-def clips_api(): return jsonify(clips=[clip_info(name) for name in drive_lines(INBOX, dirs=True)])
+def clips_api():
+    listing = run(["rclone", "lsjson", "-R", "--files-only", INBOX]).stdout
+    outputs = json.loads(run(["rclone", "lsjson", "--files-only", DRIVE_OUT]).stdout or "[]")
+    by_clip = {}
+    for item in json.loads(listing or "[]"):
+        path = item.get("Path", ""); name, _, filename = path.partition("/")
+        by_clip.setdefault(name, {})[filename] = item
+    with tempfile.TemporaryDirectory(prefix="reels-meta-") as tmp:
+        run(["rclone", "copy", INBOX, tmp, "--include", "*/clip.json"])
+        clips = []
+        for name, files in sorted(by_clip.items()):
+            try: meta = json.loads((Path(tmp) / name / "clip.json").read_text())
+            except (OSError, json.JSONDecodeError): meta = {}
+            clips.append(clip_info(name, files, meta, outputs))
+    return jsonify(clips=clips)
 
 @app.post("/api/clips")
 @require_auth
@@ -117,10 +165,11 @@ def upload_clip():
     if Path(file.filename).suffix.lower() != ".mp4": return jsonify(error="only .mp4 is supported"), 400
     name = request.form.get("name") or "-".join(restaurant.split())
     if not name or any(c in name for c in "/\\"): return jsonify(error="invalid clip name"), 400
+    if name in drive_lines(INBOX, dirs=True): return jsonify(error="ชื่อคลิปนี้มีอยู่แล้ว"), 409
     folder = Path(tempfile.mkdtemp(prefix="foodstock-reel-")); file.save(folder / "source.mp4")
     json_write(folder / "clip.json", {"restaurant": restaurant, "reviewed": False})
     run(["rclone", "copy", str(folder), f"{INBOX}/{name}/"]); shutil.rmtree(folder, ignore_errors=True)
-    return jsonify(ok=True, clip=clip_info(name)), 201
+    return jsonify(ok=True, clip=rendered_info(name)), 201
 
 def folder_source(url):
     match = re.search(r"/folders/([\w-]+)", url or "")
@@ -147,13 +196,15 @@ def import_clip():
     if not restaurant or not file_name or not name or any(c in name for c in "/\\"): return jsonify(error="file, restaurant, and valid name are required"), 400
     try: root = folder_source(payload.get("url"))
     except ValueError as exc: return jsonify(error=str(exc)), 400
+    if name in drive_lines(INBOX, dirs=True): return jsonify(error="ชื่อคลิปนี้มีอยู่แล้ว"), 409
+    if not has_remote("gdrive"): return jsonify(error="ต้องตั้ง rclone remote gdrive ก่อน (ดู #121)"), 503
     target = f"{INBOX}/{name}/source.mp4"
-    try: run(["rclone", "copyto", "--drive-server-side-across-configs", f"{root}{file_name}", target])
+    try: run(["rclone", "copyto", f"{root}{file_name}", target])
     except subprocess.CalledProcessError as exc: return jsonify(error=f"copy จาก Drive ไม่สำเร็จ: {exc.stderr.strip()}"), 502
     folder = Path(tempfile.mkdtemp(prefix="foodstock-meta-")); json_write(folder / "clip.json", {"restaurant": restaurant, "reviewed": False})
     try: run(["rclone", "copyto", str(folder / "clip.json"), f"{INBOX}/{name}/clip.json"])
     finally: shutil.rmtree(folder, ignore_errors=True)
-    return jsonify(ok=True, clip=clip_info(name)), 201
+    return jsonify(ok=True, clip=rendered_info(name)), 201
 
 @app.post("/api/clips/<name>/transcribe")
 @require_auth
@@ -161,15 +212,15 @@ def transcribe(name):
     if TRANSCRIBE_DISABLED: return jsonify(error="transcribe ทำบน Mac"), 501
     def task(log):
         folder = stage(name); log("กำลังถอดเสียง", 20); run(["npx", "hyperframes", "transcribe", str(folder / "source.mp4")]); log("ถอดเสียงเสร็จ รอ review", 80)
-        meta = json.loads((folder / "clip.json").read_text()); meta["reviewed"] = False; json_write(folder / "clip.json", meta); run(["rclone", "copy", str(folder / "transcript.json"), f"{INBOX}/{name}/"])
+        meta = json.loads((folder / "clip.json").read_text()); meta["reviewed"] = False; json_write(folder / "clip.json", meta)
+        run(["rclone", "copy", str(folder / "transcript.json"), f"{INBOX}/{name}/"]); push_json(name, "clip.json", meta)
     return jsonify(job_id=set_job(name, task)), 202
 
 @app.put("/api/clips/<name>/settings")
 @require_auth
 def settings(name):
     payload = request.get_json(silent=True) or {}
-    folder = stage(name); path = folder / "clip.json"
-    meta = json.loads(path.read_text()) if path.exists() else {}
+    meta = remote_json(name, "clip.json") or {}
     if "restaurant" in payload: meta["restaurant"] = str(payload["restaurant"]).strip() or meta.get("restaurant", name)
     if "source_duration" in payload: meta["source_duration"] = max(0, float(payload["source_duration"]))
     if "trim_start" in payload or "trim_end" in payload:
@@ -178,38 +229,37 @@ def settings(name):
         if start < 0 or end <= start or end - start > MAX_TRIM: return jsonify(error=f"trim ต้องยาวไม่เกิน {MAX_TRIM:g} วินาที"), 400
         if meta.get("source_duration") and end > float(meta["source_duration"]): return jsonify(error="trim_end เกินความยาว source"), 400
         meta["trim_start"], meta["trim_end"] = round(start, 3), round(end, 3)
-    json_write(path, meta); run(["rclone", "copy", str(path), f"{INBOX}/{name}/"])
+    push_json(name, "clip.json", meta)
     return jsonify(ok=True, settings={k: meta[k] for k in ("restaurant", "source_duration", "trim_start", "trim_end") if k in meta})
 
 @app.route("/api/clips/<name>/transcript", methods=["GET", "PUT"])
 @require_auth
 def transcript(name):
-    folder = stage(name); path = folder / "transcript.json"
     if request.method == "GET":
-        if not path.exists(): return jsonify(error="transcript not found"), 404
-        return jsonify(json.loads(path.read_text()))
+        payload = remote_json(name, "transcript.json")
+        return (jsonify(payload) if payload is not None else (jsonify(error="transcript not found"), 404))
     payload = request.get_json(silent=True)
     if isinstance(payload, list): payload = {"segments": payload}
     if not isinstance(payload, dict): return jsonify(error="JSON object or segments array required"), 400
-    json_write(path, payload); run(["rclone", "copy", str(path), f"{INBOX}/{name}/"])
+    push_json(name, "transcript.json", payload)
+    meta = remote_json(name, "clip.json") or {}; meta["reviewed"] = False; push_json(name, "clip.json", meta)
     return jsonify(ok=True)
 
 @app.post("/api/clips/<name>/review")
 @require_auth
 def review(name):
-    folder = stage(name); meta = json.loads((folder / "clip.json").read_text()); meta["reviewed"] = True; json_write(folder / "clip.json", meta)
-    run(["rclone", "copy", str(folder / "clip.json"), f"{INBOX}/{name}/"])
-    return jsonify(ok=True, clip=clip_info(name))
+    meta = remote_json(name, "clip.json") or {}; meta["reviewed"] = True; push_json(name, "clip.json", meta)
+    return jsonify(ok=True, clip=rendered_info(name))
 
 @app.post("/api/clips/<name>/render")
 @require_auth
 def render(name):
     if RENDER_DISABLED: return jsonify(error="render ทำบน Mac ผ่าน run_batch"), 501
-    info = clip_info(name)
+    info = rendered_info(name, include_next=True)
     if not info["reviewed"]: return jsonify(error="Review transcript before rendering"), 409
     def task(log):
         folder = stage(name); log("กำลังสร้าง reel", 15); run(["python3", "make_clip.py", str(folder)]); log("กำลัง render", 35)
-        output = OUT / info["output"] if info["output"] else OUT / f"{name}-v1-{__import__('datetime').date.today().isoformat()}.mp4"
+        output = OUT / info["_next_output"]
         run(["npx", "hyperframes", "render", str(folder), "--output", str(output)]); log("กำลังอัปโหลด Drive", 85); run(["rclone", "copy", str(output), DRIVE_OUT]); shutil.rmtree(folder, ignore_errors=True); output.unlink(missing_ok=True)
     return jsonify(job_id=set_job(name, task)), 202
 
@@ -226,7 +276,7 @@ def source(name): return send_file(stage(name) / "source.mp4", mimetype="video/m
 @app.get("/api/clips/<name>/output")
 @require_auth
 def output(name):
-    info = clip_info(name)
+    info = rendered_info(name)
     if not info["output"]: return jsonify(error="output not found"), 404
     target = OUT / info["output"]
     if not target.exists(): run(["rclone", "copyto", f"{DRIVE_OUT}/{info['output']}", str(target)])
