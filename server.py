@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Local FoodStock Reels editor: Drive-backed staging, review gate, and render jobs."""
-import json, os, re, secrets, shutil, subprocess, tempfile, threading, uuid
+import copy, json, math, os, re, secrets, shutil, subprocess, tempfile, threading, uuid, zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from functools import wraps
@@ -21,6 +21,7 @@ jobs, jobs_lock = {}, threading.Lock()
 stage_locks, stage_locks_lock = {}, threading.Lock()
 project_locks, project_locks_lock = {}, threading.Lock()
 project_create_lock = threading.Lock()
+media_locks, media_locks_guard = {}, threading.Lock()
 project_rendering, project_rendering_lock = set(), threading.Lock()
 app = Flask(__name__, static_folder=None)
 
@@ -148,7 +149,11 @@ def project_path(slug):
 def read_project(slug):
     folder = project_path(slug)
     if not folder or not (folder / "project.json").is_file(): return None
-    try: return json.loads((folder / "project.json").read_text(encoding="utf-8"))
+    try:
+        p = json.loads((folder / "project.json").read_text(encoding="utf-8"))
+        for key, default in (("goal_type", None), ("pattern", None), ("logo", None), ("step", 1)):
+            p.setdefault(key, default)
+        return p
     except (OSError, json.JSONDecodeError): return None
 
 def write_project(folder, project):
@@ -160,19 +165,71 @@ def write_project(folder, project):
     finally:
         Path(tmp).unlink(missing_ok=True)
 
+def finite_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+def pattern_error(pattern):
+    if pattern is None: return None
+    if not isinstance(pattern, dict): return "pattern must be an object or null"
+    if not isinstance(pattern.get("id"), str) or not re.fullmatch(r"[a-z0-9-]+", pattern["id"]): return "pattern.id is invalid"
+    if not isinstance(pattern.get("name"), str): return "pattern.name must be a string"
+    if not isinstance(pattern.get("shots"), list) or not pattern["shots"]: return "pattern.shots must be a non-empty array"
+    for i, shot in enumerate(pattern["shots"]):
+        if not isinstance(shot, dict) or not finite_number(shot.get("seconds")) or shot["seconds"] <= 0: return f"pattern.shots[{i}].seconds must be greater than zero"
+        if shot.get("role") is not None and not isinstance(shot["role"], str): return f"pattern.shots[{i}].role must be a string or null"
+    return None
+
+def load_patterns():
+    folder = REELS_ROOT / "patterns"
+    if not folder.is_dir() or not any(folder.iterdir()): folder = ROOT / "patterns-sample"
+    result = {"patterns": [], "goal_types": [], "source": "patterns-sample" if folder == ROOT / "patterns-sample" else "REELS_ROOT/patterns", "errors": []}
+    for path in sorted(folder.glob("*.json")):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if path.name == "goal-types.json":
+                if not isinstance(value, list) or any(not isinstance(x, str) or not x.strip() for x in value): raise ValueError("goal_types must be an array of non-empty strings")
+                result["goal_types"] = value
+            else:
+                error = pattern_error(value)
+                if value is None: error = "pattern must be an object"
+                if error: raise ValueError(error)
+                if value["id"] != path.stem: raise ValueError("pattern.id must match filename stem")
+                result["patterns"].append(value)
+        except (ValueError, OSError) as exc:
+            result["errors"].append({"file": path.name, "error": str(exc)})
+    return result
+
 def project_error(project):
+    if not isinstance(project.get("prompt", ""), str): return "prompt must be a string"
+    if not finite_number(project.get("target_seconds")) or project["target_seconds"] <= 0: return "target_seconds must be greater than zero"
+    if project.get("goal_type") is not None and project["goal_type"] not in load_patterns()["goal_types"]: return "goal_type must be in goal-types or null"
+    error = pattern_error(project.get("pattern"))
+    if error: return error
+    if type(project.get("step", 1)) is not int or not 1 <= project.get("step", 1) <= 5: return "step must be an integer from 1 to 5"
+    logo = project.get("logo")
+    if logo is not None:
+        if not isinstance(logo, dict): return "logo must be an object or null"
+        if logo.get("position") not in ("tl", "tr", "bl", "br"): return "logo.position must be tl, tr, bl or br"
+        if not finite_number(logo.get("size_pct")) or not 8 <= logo["size_pct"] <= 24: return "logo.size_pct must be from 8 to 24"
+    if not isinstance(project.get("scenes", []), list): return "scenes must be an array"
     source_map = {x.get("id"): x for x in project.get("sources", [])}
+    ids = set()
     for i, scene in enumerate(project.get("scenes", [])):
         field = f"scenes[{i}]"
-        source = source_map.get(scene.get("source"))
+        if not isinstance(scene, dict): return f"{field} must be an object"
+        if not isinstance(scene.get("id"), str) or not scene["id"] or scene["id"] in ids: return f"{field}.id must be unique"
+        ids.add(scene["id"])
+        source = source_map.get(scene.get("source")) if isinstance(scene.get("source"), str) else None
         if not source: return f"{field}.source: source does not exist"
-        try: start, end, duration = float(scene["in"]), float(scene["out"]), float(source["duration"])
-        except (KeyError, TypeError, ValueError): return f"{field}.in/out: invalid time or source duration"
-        if not (0 <= start < end <= duration): return f"{field}.in/out: require 0 ≤ in < out ≤ duration"
+        start, end = scene.get("in"), scene.get("out")
+        if not finite_number(start) or not finite_number(end) or not (0 <= start < end <= source["duration"]): return f"{field}.in/out: require 0 ≤ in < out ≤ duration"
+        if not isinstance(scene.get("subtitles", []), list): return f"{field}.subtitles must be an array"
+        if scene.get("reason") is not None and not isinstance(scene["reason"], str): return f"{field}.reason must be a string"
         for j, subtitle in enumerate(scene.get("subtitles", [])):
-            try: a, b = float(subtitle["start"]), float(subtitle["end"])
-            except (KeyError, TypeError, ValueError): return f"{field}.subtitles[{j}].start/end: invalid time"
-            if not (0 <= a <= b <= end - start): return f"{field}.subtitles[{j}]: times must be inside scene length"
+            if not isinstance(subtitle, dict): return f"{field}.subtitles[{j}] must be an object"
+            a, b = subtitle.get("start"), subtitle.get("end")
+            if not finite_number(a) or not finite_number(b) or not (0 <= a <= b <= end - start + 1e-9): return f"{field}.subtitles[{j}]: times must be inside scene length"
+            if not isinstance(subtitle.get("text", ""), str): return f"{field}.subtitles[{j}].text must be a string"
     return None
 
 def video_dimensions(stream):
@@ -187,7 +244,7 @@ def video_dimensions(stream):
 def project_summary(slug, p):
     sources = p.get("sources", []); thumb = sources[0].get("thumb") if sources else None
     thumb_name = Path(thumb).name if thumb else None
-    return {"slug": slug, "name": p.get("name", slug), "restaurant": p.get("restaurant", ""), "status": p.get("status", "draft"), "sources": len(sources), "scenes": len(p.get("scenes", [])), "updated_at": p.get("updated_at"), "thumb": f"/api/projects/{slug}/thumbs/{thumb_name}" if thumb else None}
+    return {"slug": slug, "name": p.get("name", slug), "restaurant": p.get("restaurant", ""), "status": p.get("status", "draft"), "goal_type": p.get("goal_type"), "step": p.get("step", 1), "sources": len(sources), "scenes": len(p.get("scenes", [])), "updated_at": p.get("updated_at"), "thumb": f"/api/projects/{slug}/thumbs/{thumb_name}" if thumb else None}
 
 def trash_move(path, slug):
     TRASH.mkdir(parents=True, exist_ok=True)
@@ -196,6 +253,20 @@ def trash_move(path, slug):
     while target.exists(): target = TRASH / f"{slug}-{stamp}-{suffix}"; suffix += 1
     os.rename(path, target)
     return str(target)
+
+def media_lock(slug):
+    with media_locks_guard: return media_locks.setdefault(slug, threading.RLock())
+
+def project_media(fn):
+    @wraps(fn)
+    def wrapped(slug, *args, **kwargs):
+        # Serializes file lifecycle/cache/export work. project_lock only guards JSON.
+        with media_lock(slug): return fn(slug, *args, **kwargs)
+    return wrapped
+
+def bump_project(folder, p):
+    p["rev"] += 1; p["updated_at"] = datetime.now(timezone.utc).isoformat()
+    write_project(folder, p)
 
 @app.get("/")
 def index(): return send_from_directory(ROOT, "editor.html")
@@ -218,20 +289,20 @@ def projects_api():
 @require_auth
 def create_project():
     data = request.get_json(silent=True) or {}; name = str(data.get("name", "")).strip(); restaurant = str(data.get("restaurant", "")).strip()
-    if not name or not restaurant: return jsonify(error="name and restaurant are required"), 400
+    if not name: return jsonify(error="name is required"), 400
     clean = re.sub(r"[/\\]|\.\.", "", name); clean = re.sub(r"\s+", "", clean); clean = re.sub(r"[^\w\-\u0E00-\u0E7F]", "", clean, flags=re.UNICODE).strip("-_")
     if not clean: clean = "project"
     PROJECTS.mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc).isoformat()
     try: target = float(data.get("target_seconds", 30))
     except (TypeError, ValueError): return jsonify(error="target_seconds must be numeric"), 400
-    if target <= 0: return jsonify(error="target_seconds must be greater than zero"), 400
+    if not math.isfinite(target) or target <= 0: return jsonify(error="target_seconds must be greater than zero"), 400
     with project_create_lock:
         slug = clean; n = 2
         while (PROJECTS / slug).exists(): slug = f"{clean}-{n}"; n += 1
         with project_lock(slug):
             folder = PROJECTS / slug; folder.mkdir(); (folder / "sources").mkdir(); (folder / "thumbs").mkdir()
-            p = {"name": name, "restaurant": restaurant, "platform": "ig_reels", "target_seconds": target, "prompt": "", "sources": [], "scenes": [], "status": "draft", "rev": 1, "created_at": now, "updated_at": now}
+            p = {"name": name, "restaurant": restaurant, "platform": "ig_reels", "target_seconds": target, "prompt": "", "goal_type": None, "pattern": None, "logo": None, "step": 1, "sources": [], "scenes": [], "status": "draft", "rev": 1, "created_at": now, "updated_at": now}
             write_project(folder, p)
     return jsonify(slug=slug, project=p), 201
 
@@ -250,8 +321,22 @@ def put_project(slug):
         current = read_project(slug)
         if current is None: return jsonify(error="project not found"), 404
         if payload.get("rev") != current.get("rev"): return jsonify(error="project revision conflict", current_rev=current["rev"]), 409
-        saved = dict(payload); saved["sources"] = current.get("sources", []); saved["rev"] = current["rev"] + 1
+        saved = dict(current); saved.update(payload); saved["sources"] = current.get("sources", []); saved["rev"] = current["rev"] + 1
         saved["created_at"] = current.get("created_at"); saved["updated_at"] = datetime.now(timezone.utc).isoformat()
+        # File names belong to upload/delete routes, never to the draft client.
+        if current.get("logo"):
+            client_logo = payload.get("logo", current["logo"])
+            if client_logo is not None and not isinstance(client_logo, dict): return jsonify(error="logo must be an object or null"), 400
+            saved["logo"] = dict(current["logo"])
+            for key in ("position", "size_pct"):
+                if isinstance(client_logo, dict) and key in client_logo: saved["logo"][key] = client_logo[key]
+        else:
+            client_logo = payload.get("logo")
+            if client_logo is not None:
+                if not isinstance(client_logo, dict): return jsonify(error="logo must be an object or null"), 400
+                if "position" in client_logo and client_logo["position"] not in ("tl", "tr", "bl", "br"): return jsonify(error="logo.position is invalid"), 400
+                if "size_pct" in client_logo and (not finite_number(client_logo["size_pct"]) or not 8 <= client_logo["size_pct"] <= 24): return jsonify(error="logo.size_pct must be from 8 to 24"), 400
+            saved["logo"] = None
         error = project_error(saved)
         if error: return jsonify(error=error), 400
         write_project(folder, saved)
@@ -259,6 +344,7 @@ def put_project(slug):
 
 @app.delete("/api/projects/<slug>")
 @require_auth
+@project_media
 def delete_project(slug):
     folder = project_path(slug)
     if not folder or not folder.is_dir(): return jsonify(error="project not found"), 404
@@ -271,34 +357,35 @@ def delete_project(slug):
 
 @app.post("/api/projects/<slug>/sources")
 @require_auth
+@project_media
 def add_project_sources(slug):
     folder = project_path(slug); files = request.files.getlist("files") or request.files.getlist("file")
     if not folder or not files: return jsonify(error="project and video files are required"), 400
-    with project_lock(slug):
-        p = read_project(slug)
-        if p is None: return jsonify(error="project not found"), 404
-        staged = []; created_paths = []
-        try:
-            for upload in files:
-                original = Path(upload.filename or "").name
-                ext = Path(original).suffix.lower()
-                if ext not in (".mp4", ".mov"): raise ValueError(f"{original}: only .mp4/.mov are supported")
-                nums = [int(re.search(r"\d+", s["id"]).group()) for s in p["sources"] if re.fullmatch(r"s\d+", s.get("id", ""))]
-                nums += [int(re.search(r"\d+", x["id"]).group()) for x in staged]
-                sid = f"s{max(nums, default=0)+1}"
-                dst = folder / "sources" / f"{sid}{ext}"; upload.save(dst); created_paths.append(dst)
-                probe = json.loads(run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "format=duration:stream=width,height:stream_tags=rotate:stream_side_data=rotation", "-of", "json", str(dst)]).stdout)
-                stream = next(x for x in probe.get("streams", []) if x.get("width") and x.get("height"))
-                width, height = video_dimensions(stream)
-                duration = float(probe["format"]["duration"]); thumb_rel = f"thumbs/{sid}.jpg"
-                thumb_path = folder / thumb_rel; run(["ffmpeg", "-y", "-ss", "1", "-i", str(dst), "-frames:v", "1", "-q:v", "2", str(thumb_path)]); created_paths.append(thumb_path)
-                staged.append({"id": sid, "file": f"sources/{sid}{ext}", "duration": round(duration, 3), "width": width, "height": height, "thumb": thumb_rel, "original_name": original})
-            p["sources"].extend(staged); p["rev"] += 1; p["updated_at"] = datetime.now(timezone.utc).isoformat(); write_project(folder, p)
-        except (ValueError, KeyError, StopIteration, subprocess.CalledProcessError, json.JSONDecodeError) as exc:
-            for path in created_paths:
-                if path.exists(): trash_move(path, f"{slug}-failed-upload")
-            if isinstance(exc, ValueError): return jsonify(error=str(exc)), 400
-            return jsonify(error=f"could not process source: {exc}"), 422
+    with project_lock(slug): p = read_project(slug)
+    if p is None: return jsonify(error="project not found"), 404
+    staged = []; created_paths = []
+    try:
+        for upload in files:
+            original = Path(upload.filename or "").name; ext = Path(original).suffix.lower()
+            if ext not in (".mp4", ".mov"): raise ValueError(f"{original}: only .mp4/.mov are supported")
+            nums = [int(x["id"][1:]) for x in p["sources"] + staged if re.fullmatch(r"s\d+", x.get("id", ""))]
+            sid = f"s{max(nums, default=0)+1}"
+            dst = folder / "sources" / f"{sid}{ext}"; created_paths.append(dst); upload.save(dst)
+            probe = json.loads(run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "format=duration:stream=width,height:stream_tags=rotate:stream_side_data=rotation", "-of", "json", str(dst)]).stdout)
+            stream = next(x for x in probe.get("streams", []) if x.get("width") and x.get("height"))
+            width, height = video_dimensions(stream); duration = float(probe["format"]["duration"])
+            if not math.isfinite(duration) or duration <= .1: raise ValueError(f"{original}: duration must exceed 0.1s")
+            if height <= width: raise ValueError(f"{original}: source must be portrait")
+            thumb_rel = f"thumbs/{sid}.jpg"; thumb_path = folder / thumb_rel; created_paths.append(thumb_path)
+            run(["ffmpeg", "-y", "-ss", str(min(1, duration / 2)), "-i", str(dst), "-frames:v", "1", "-q:v", "2", str(thumb_path)])
+            staged.append({"id": sid, "file": f"sources/{sid}{ext}", "duration": round(duration, 3), "width": width, "height": height, "thumb": thumb_rel, "original_name": original})
+        with project_lock(slug):
+            p = read_project(slug)
+            p["sources"].extend(staged); bump_project(folder, p)
+    except (OSError, ValueError, KeyError, StopIteration, subprocess.CalledProcessError) as exc:
+        for path in created_paths:
+            if path.exists(): trash_move(path, f"{slug}-failed-upload")
+        return jsonify(error=f"could not process source: {exc}"), 400 if isinstance(exc, ValueError) else 422
     return jsonify(sources=p["sources"], rev=p["rev"]), 201
 
 @app.get("/api/projects/<slug>/thumbs/<thumb>")
@@ -319,6 +406,7 @@ def project_source(slug, sid):
 
 @app.delete("/api/projects/<slug>/sources/<sid>")
 @require_auth
+@project_media
 def delete_project_source(slug, sid):
     folder = project_path(slug)
     if not folder: return jsonify(error="project not found"), 404
@@ -333,9 +421,218 @@ def delete_project_source(slug, sid):
             trash_move(folder / src["file"], f"{slug}-{sid}")
             thumb_path = folder / src["thumb"]
             if thumb_path.exists(): trash_move(thumb_path, f"{slug}-{sid}-thumb")
+            analysis = folder / "analysis" / sid
+            if analysis.exists(): trash_move(analysis, f"{slug}-{sid}-analysis")
         except OSError as exc: return jsonify(error=f"could not move source to trash: {exc}"), 500
         p["sources"].remove(src); p["rev"] += 1; p["updated_at"] = datetime.now(timezone.utc).isoformat(); write_project(folder, p)
     return jsonify(sources=p["sources"], rev=p["rev"])
+
+@app.get("/api/patterns")
+@require_auth
+def patterns_api(): return jsonify(load_patterns())
+
+@app.route("/api/projects/<slug>/logo", methods=["GET", "POST", "DELETE"])
+@require_auth
+@project_media
+def project_logo(slug):
+    folder = project_path(slug)
+    with project_lock(slug): p = read_project(slug)
+    if p is None: return jsonify(error="project not found"), 404
+    logo = p.get("logo")
+    if request.method == "GET":
+        path = folder / logo["file"] if logo else None
+        if not path or not path.is_file(): return jsonify(error="logo not found"), 404
+        response = send_file(path, conditional=True)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        if path.suffix == ".svg": response.headers["Content-Security-Policy"] = "default-src 'none'; style-src 'unsafe-inline'"
+        return response
+    if request.method == "DELETE":
+        with project_lock(slug):
+            p = read_project(slug)
+            if p.get("logo"):
+                path = folder / p["logo"]["file"]
+                if path.exists(): trash_move(path, f"{slug}-logo")
+            p["logo"] = None; bump_project(folder, p)
+        return jsonify(logo=None, rev=p["rev"])
+    files = [upload for key in request.files for upload in request.files.getlist(key)]
+    if len(files) != 1: return jsonify(error="logo requires one file"), 400
+    upload = files[0]; original = Path(upload.filename or "").name; ext = Path(original).suffix.lower()
+    if ext not in (".png", ".jpg", ".webp", ".svg"): return jsonify(error="logo must be png/jpg/webp/svg"), 400
+    content = upload.stream.read(2 * 1024 * 1024 + 1)
+    if not content or len(content) > 2 * 1024 * 1024: return jsonify(error="logo must be non-empty and at most 2 MB"), 400
+    fd, temp = tempfile.mkstemp(prefix=".logo-", dir=folder)
+    try:
+        with os.fdopen(fd, "wb") as f: f.write(content)
+        with project_lock(slug):
+            p = read_project(slug); previous = p.get("logo")
+            if previous and (folder / previous["file"]).exists(): trash_move(folder / previous["file"], f"{slug}-logo")
+            filename = f"logo{ext}"; os.replace(temp, folder / filename)
+            p["logo"] = {"file": filename, "original_name": original, "position": previous["position"] if previous else "tl", "size_pct": previous["size_pct"] if previous else 14}
+            bump_project(folder, p)
+    finally:
+        if Path(temp).exists(): trash_move(Path(temp), f"{slug}-logo-temp")
+    return jsonify(logo=p["logo"], rev=p["rev"])
+
+def source_file(folder, source):
+    path = folder / source["file"]
+    if not path.resolve().is_relative_to((folder / "sources").resolve()): raise ValueError("source.file is outside sources")
+    return path
+
+def frame_path(folder, source, moment):
+    maximum = max(0, float(source["duration"]) - .05)
+    moment = min(maximum, max(0, moment))
+    rounded = round(moment, 1)
+    cache = folder / "analysis" / source["id"] / "frames" / f"{rounded:.1f}.jpg"
+    if cache.is_file(): return cache
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp = tempfile.mkstemp(prefix=".frame-", suffix=".jpg", dir=cache.parent); os.close(fd)
+    try:
+        run(["ffmpeg", "-y", "-ss", str(min(maximum, rounded)), "-i", str(source_file(folder, source)), "-frames:v", "1", "-vf", "scale=270:-2", temp])
+        if not Path(temp).stat().st_size: raise ValueError("ffmpeg produced no frame")
+        os.replace(temp, cache)
+    finally:
+        if Path(temp).exists(): trash_move(Path(temp), f"{folder.name}-frame-temp")
+    return cache
+
+@app.get("/api/projects/<slug>/sources/<sid>/frame")
+@require_auth
+@project_media
+def project_frame(slug, sid):
+    with project_lock(slug): p = read_project(slug)
+    source = next((x for x in p["sources"] if x["id"] == sid), None) if p else None
+    if source is None: return jsonify(error="source not found"), 404
+    try:
+        moment = float(request.args.get("t", 0))
+        if not math.isfinite(moment): raise ValueError()
+    except (TypeError, ValueError): return jsonify(error="t must be a finite number"), 400
+    try: return send_file(frame_path(project_path(slug), source, moment), mimetype="image/jpeg", conditional=True)
+    except (OSError, ValueError, subprocess.CalledProcessError) as exc: return jsonify(error=f"frame failed: {exc}"), 422
+
+def cut_candidates(folder, source):
+    cache = folder / "analysis" / source["id"] / "cuts-0.3.json"
+    if cache.is_file():
+        try:
+            cuts = json.loads(cache.read_text())
+            if isinstance(cuts, list) and all(finite_number(x) and 0 <= x < source["duration"] for x in cuts): return sorted(cuts), False
+        except (ValueError, OSError): pass
+    try:
+        result = run(["ffmpeg", "-i", str(source_file(folder, source)), "-vf", "select='gt(scene,0.3)',showinfo", "-an", "-f", "null", "-"])
+        cuts = sorted({float(x) for x in re.findall(r"pts_time:([0-9.]+)", result.stderr) if 0 <= float(x) < source["duration"]})
+    except (OSError, ValueError, subprocess.CalledProcessError): return [], True
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp = tempfile.mkstemp(prefix=".cuts-", dir=cache.parent)
+    try:
+        with os.fdopen(fd, "w") as f: json.dump(cuts, f)
+        os.replace(temp, cache)
+    finally:
+        if Path(temp).exists(): trash_move(Path(temp), f"{folder.name}-cuts-temp")
+    return cuts, False
+
+@app.post("/api/projects/<slug>/autocut")
+@require_auth
+@project_media
+def project_autocut(slug):
+    with project_lock(slug): p = read_project(slug)
+    if p is None: return jsonify(error="project not found"), 404
+    # Optional draft fields let the wizard preview an unsaved pattern and locks.
+    payload = request.get_json(silent=True)
+    if payload is not None:
+        if not isinstance(payload, dict): return jsonify(error="autocut body must be an object"), 400
+        for key in ("pattern", "scenes"):
+            if key in payload: p[key] = payload[key]
+    if not p.get("pattern"): return jsonify(error="pattern is required"), 400
+    if not p.get("sources"): return jsonify(error="sources are required"), 400
+    error = project_error(p)
+    if error: return jsonify(error=error), 400
+    folder = project_path(slug); candidates = {}; skipped = []
+    for source in p["sources"]:
+        cuts, failed = cut_candidates(folder, source); candidates[source["id"]] = cuts
+        if failed: skipped.append(source["id"])
+    cursors = {s["id"]: 0 for s in p["sources"]}; old = p.get("scenes", []); scenes = []
+    used_ids = {s.get("id") for s in old}; next_id = 1
+    for i, shot in enumerate(p["pattern"]["shots"]):
+        if i < len(old) and old[i].get("locked"):
+            scenes.append(copy.deepcopy(old[i])); continue
+        source = p["sources"][i % len(p["sources"])]; sid = source["id"]; duration = source["duration"]
+        cursor = cursors[sid]
+        for attempt in range(2):
+            start = next((cut for cut in candidates[sid] if cut >= cursor), cursor) + .1
+            if start + .5 <= duration: break
+            cursor = 0
+        # Sub-half-second sources or cuts too close to EOF still yield a valid shot.
+        if start >= duration: start = min(.1, duration / 2)
+        end = min(start + shot["seconds"], duration)
+        while f"sc{next_id}" in used_ids: next_id += 1
+        scene_id = f"sc{next_id}"; used_ids.add(scene_id)
+        scenes.append({"id": scene_id, "source": sid, "in": start, "out": end, "locked": False, "reason": shot.get("role") or "", "subtitles": [{"start": 0, "end": end - start, "text": "", "origin": "manual"}]})
+        cursors[sid] = end + 1
+    scenes.extend(copy.deepcopy(s) for s in old[len(p["pattern"]["shots"]):] if s.get("locked"))
+    return jsonify(scenes=scenes, total=sum(s["out"] - s["in"] for s in scenes), target=p["target_seconds"], skipped_sources=skipped)
+
+def edit_manifest(p):
+    used = {s["source"] for s in p.get("scenes", [])}; pattern = p.get("pattern"); logo = p.get("logo")
+    return {"goal": p.get("prompt", ""), "goal_type": p.get("goal_type"), "target_seconds": p.get("target_seconds", 30), "platform": "ig_reels_1080x1920",
+            "pattern": {"id": pattern["id"], "name": pattern["name"], "shots": [{"seconds": s["seconds"], "role": s.get("role")} for s in pattern["shots"]]} if pattern else None,
+            "logo": {k: logo[k] for k in ("file", "original_name", "position", "size_pct")} if logo else None,
+            "sources": [{"id": s["id"], "file": s["file"], "original_name": s.get("original_name", Path(s["file"]).name), "duration": s["duration"]} for s in p.get("sources", []) if s["id"] in used],
+            "shots": [{"source": s["source"], "in": s["in"], "out": s["out"], "role": s.get("reason") or None, "subtitle": (s.get("subtitles") or [{}])[0].get("text", ""), "keyframe": f"keyframes/shot-{i+1:02d}.jpg"} for i, s in enumerate(p.get("scenes", []))]}
+
+@app.get("/api/projects/<slug>/edit.json")
+@require_auth
+def project_edit(slug):
+    with project_lock(slug): p = read_project(slug)
+    return jsonify(edit_manifest(p)) if p is not None else (jsonify(error="project not found"), 404)
+
+EXPORT_NAME = re.compile(r"^[\w\-\u0e00-\u0e7f]+\.zip$")
+
+@app.post("/api/projects/<slug>/export")
+@require_auth
+@project_media
+def project_export(slug):
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict): return jsonify(error="rev is required"), 400
+    with project_lock(slug): p = read_project(slug)
+    if p is None: return jsonify(error="project not found"), 404
+    if payload.get("rev") != p["rev"]: return jsonify(error="project revision conflict", current_rev=p["rev"]), 409
+    if not p.get("scenes"): return jsonify(error="scenes are required"), 400
+    folder = project_path(slug); exports = folder / "exports"; exports.mkdir(exist_ok=True)
+    versions = [int(m.group(1)) for path in exports.iterdir() if (m := re.fullmatch(re.escape(slug) + r"-v(\d+)-\d{4}-\d{2}-\d{2}\.zip", path.name))]
+    name = f"{slug}-v{max(versions, default=0)+1}-{datetime.now().date().isoformat()}.zip"
+    fd, temp = tempfile.mkstemp(prefix=".export-", suffix=".zip", dir=exports); os.close(fd)
+    try:
+        manifest = edit_manifest(p); source_map = {s["id"]: s for s in p["sources"]}
+        with zipfile.ZipFile(temp, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+            archive.writestr("edit.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+            for source in manifest["sources"]: archive.write(source_file(folder, source), source["file"])
+            if manifest["logo"]: archive.write(folder / manifest["logo"]["file"], manifest["logo"]["file"])
+            for scene, shot in zip(p["scenes"], manifest["shots"]):
+                archive.write(frame_path(folder, source_map[scene["source"]], (scene["in"] + scene["out"]) / 2), shot["keyframe"])
+        os.replace(temp, exports / name)
+        return jsonify(name=name, size=(exports / name).stat().st_size)
+    except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as exc:
+        return jsonify(error=f"export failed: {exc}"), 422
+    finally:
+        if Path(temp).exists(): trash_move(Path(temp), f"{slug}-export-temp")
+
+@app.get("/api/projects/<slug>/exports")
+@require_auth
+def project_exports(slug):
+    folder = project_path(slug)
+    if read_project(slug) is None: return jsonify(error="project not found"), 404
+    items = []
+    for path in (folder / "exports").glob("*.zip"):
+        if EXPORT_NAME.fullmatch(path.name) and path.is_file():
+            stat = path.stat(); items.append({"name": path.name, "size": stat.st_size, "mtime": stat.st_mtime})
+    return jsonify(exports=sorted(items, key=lambda x: x["mtime"], reverse=True))
+
+@app.get("/api/projects/<slug>/exports/<name>")
+@require_auth
+def project_download(slug, name):
+    folder = project_path(slug)
+    if not folder or not EXPORT_NAME.fullmatch(name): return jsonify(error="export not found"), 404
+    path = folder / "exports" / name
+    if not path.is_file() or not path.resolve().is_relative_to(folder.resolve()): return jsonify(error="export not found"), 404
+    return send_file(path, mimetype="application/zip", as_attachment=True, conditional=True)
 
 @app.get("/fonts/<path:name>")
 def fonts(name): return send_from_directory(ROOT / "fonts", name)
