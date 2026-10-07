@@ -1,0 +1,28 @@
+{
+  "id": "sample-1",
+  "name": "ตัวอย่าง 1",
+  "description": "ตัวอย่างชั่วคราวสำหรับทดสอบ — เปลี่ยนเป็น pattern จาก playbook",
+  "sample": true,
+  "shots": [
+    {
+      "seconds": 1.5,
+      "role": "hook"
+    },
+    {
+      "seconds": 1
+    },
+    {
+      "seconds": 1.2
+    },
+    {
+      "seconds": 2
+    },
+    {
+      "seconds": 1
+    },
+    {
+      "seconds": 1.5,
+      "role": "cta"
+    }
+  ]
+}
