@@ -72,7 +72,7 @@ def report(number, fn):
 
 
 def fixture(path, second=False):
-    colors = ['red', 'blue', 'white', 'black'] if not second else ['green', 'magenta', 'black', 'white']
+    colors = ['black', 'white', 'red', 'cyan'] if not second else ['black', 'white', 'blue', 'yellow']
     cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y']
     for color, duration in zip(colors, [2, 5, 9, 3]):
         cmd += ['-f', 'lavfi', '-i', 'color=c=%s:s=270x480:r=25:d=%s' % (color, duration)]
