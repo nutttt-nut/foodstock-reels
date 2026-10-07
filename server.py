@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Local FoodStock Reels editor: Drive-backed staging, review gate, and render jobs."""
 import json, os, re, secrets, shutil, subprocess, tempfile, threading, uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from functools import wraps
 from flask import Flask, Response, jsonify, request, send_file, send_from_directory
@@ -8,6 +9,8 @@ from flask import Flask, Response, jsonify, request, send_file, send_from_direct
 ROOT = Path(__file__).resolve().parent
 CLIPS = ROOT / "clips"; OUT = ROOT / "out"; TEMPLATE = ROOT / "template"
 REMOTE = os.environ.get("RCLONE_REMOTE", "gdrive")
+REELS_ROOT = Path(os.path.expanduser(os.environ.get("REELS_ROOT", "~/FoodStockReels")))
+PROJECTS = REELS_ROOT / "projects"; TRASH = REELS_ROOT / ".trash"
 INBOX = f"{REMOTE}:{os.environ.get('RCLONE_INBOX', 'FoodStockReels/inbox')}"
 DRIVE_OUT = f"{REMOTE}:{os.environ.get('RCLONE_OUTBOX', 'FoodStockReels/out')}"
 PORT = int(os.environ.get("REELS_EDITOR_PORT", "8091"))
@@ -16,6 +19,9 @@ TRANSCRIBE_DISABLED = os.environ.get("REELS_TRANSCRIBE_DISABLED", "0") == "1"
 MAX_TRIM = float(os.environ.get("REELS_MAX_TRIM", "30"))
 jobs, jobs_lock = {}, threading.Lock()
 stage_locks, stage_locks_lock = {}, threading.Lock()
+project_locks, project_locks_lock = {}, threading.Lock()
+project_create_lock = threading.Lock()
+project_rendering, project_rendering_lock = set(), threading.Lock()
 app = Flask(__name__, static_folder=None)
 
 def authorized():
@@ -131,11 +137,205 @@ def update_job(job_id, **values):
 def json_write(path, value):
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
+def project_lock(slug):
+    with project_locks_lock: return project_locks.setdefault(slug, threading.Lock())
+
+def project_path(slug):
+    if not re.fullmatch(r"[\w\-\u0E00-\u0E7F]+", slug, re.UNICODE): return None
+    path = PROJECTS / slug
+    return path if path.parent.resolve() == PROJECTS.resolve() and (not path.exists() or path.resolve().parent == PROJECTS.resolve()) else None
+
+def read_project(slug):
+    folder = project_path(slug)
+    if not folder or not (folder / "project.json").is_file(): return None
+    try: return json.loads((folder / "project.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError): return None
+
+def write_project(folder, project):
+    fd, tmp = tempfile.mkstemp(prefix=".project-", suffix=".json", dir=folder)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(project, f, ensure_ascii=False, indent=2); f.write("\n"); f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, folder / "project.json")
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+def project_error(project):
+    source_map = {x.get("id"): x for x in project.get("sources", [])}
+    for i, scene in enumerate(project.get("scenes", [])):
+        field = f"scenes[{i}]"
+        source = source_map.get(scene.get("source"))
+        if not source: return f"{field}.source: source does not exist"
+        try: start, end, duration = float(scene["in"]), float(scene["out"]), float(source["duration"])
+        except (KeyError, TypeError, ValueError): return f"{field}.in/out: invalid time or source duration"
+        if not (0 <= start < end <= duration): return f"{field}.in/out: require 0 ≤ in < out ≤ duration"
+        for j, subtitle in enumerate(scene.get("subtitles", [])):
+            try: a, b = float(subtitle["start"]), float(subtitle["end"])
+            except (KeyError, TypeError, ValueError): return f"{field}.subtitles[{j}].start/end: invalid time"
+            if not (0 <= a <= b <= end - start): return f"{field}.subtitles[{j}]: times must be inside scene length"
+    return None
+
+def video_dimensions(stream):
+    width, height = int(stream["width"]), int(stream["height"])
+    rotation = next((item.get("rotation") for item in stream.get("side_data_list", []) if item.get("rotation") is not None), None)
+    if rotation is None: rotation = stream.get("tags", {}).get("rotate")
+    try:
+        if abs(float(rotation)) % 180 == 90: width, height = height, width
+    except (TypeError, ValueError): pass
+    return width, height
+
+def project_summary(slug, p):
+    sources = p.get("sources", []); thumb = sources[0].get("thumb") if sources else None
+    thumb_name = Path(thumb).name if thumb else None
+    return {"slug": slug, "name": p.get("name", slug), "restaurant": p.get("restaurant", ""), "status": p.get("status", "draft"), "sources": len(sources), "scenes": len(p.get("scenes", [])), "updated_at": p.get("updated_at"), "thumb": f"/api/projects/{slug}/thumbs/{thumb_name}" if thumb else None}
+
+def trash_move(path, slug):
+    TRASH.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    target = TRASH / f"{slug}-{stamp}"; suffix = 1
+    while target.exists(): target = TRASH / f"{slug}-{stamp}-{suffix}"; suffix += 1
+    os.rename(path, target)
+    return str(target)
+
 @app.get("/")
 def index(): return send_from_directory(ROOT, "editor.html")
 
 @app.get("/api/config")
 def config(): return jsonify(drive_import=has_remote("gdrive"), remote=REMOTE)
+
+@app.get("/api/projects")
+@require_auth
+def projects_api():
+    PROJECTS.mkdir(parents=True, exist_ok=True)
+    result = []
+    for folder in sorted(PROJECTS.iterdir()):
+        if folder.is_dir():
+            p = read_project(folder.name)
+            if p: result.append(project_summary(folder.name, p))
+    return jsonify(projects=result)
+
+@app.post("/api/projects")
+@require_auth
+def create_project():
+    data = request.get_json(silent=True) or {}; name = str(data.get("name", "")).strip(); restaurant = str(data.get("restaurant", "")).strip()
+    if not name or not restaurant: return jsonify(error="name and restaurant are required"), 400
+    clean = re.sub(r"[/\\]|\.\.", "", name); clean = re.sub(r"\s+", "", clean); clean = re.sub(r"[^\w\-\u0E00-\u0E7F]", "", clean, flags=re.UNICODE).strip("-_")
+    if not clean: clean = "project"
+    PROJECTS.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc).isoformat()
+    try: target = float(data.get("target_seconds", 30))
+    except (TypeError, ValueError): return jsonify(error="target_seconds must be numeric"), 400
+    if target <= 0: return jsonify(error="target_seconds must be greater than zero"), 400
+    with project_create_lock:
+        slug = clean; n = 2
+        while (PROJECTS / slug).exists(): slug = f"{clean}-{n}"; n += 1
+        with project_lock(slug):
+            folder = PROJECTS / slug; folder.mkdir(); (folder / "sources").mkdir(); (folder / "thumbs").mkdir()
+            p = {"name": name, "restaurant": restaurant, "platform": "ig_reels", "target_seconds": target, "prompt": "", "sources": [], "scenes": [], "status": "draft", "rev": 1, "created_at": now, "updated_at": now}
+            write_project(folder, p)
+    return jsonify(slug=slug, project=p), 201
+
+@app.get("/api/projects/<slug>")
+@require_auth
+def get_project(slug):
+    p = read_project(slug)
+    return jsonify(p) if p else (jsonify(error="project not found"), 404)
+
+@app.put("/api/projects/<slug>")
+@require_auth
+def put_project(slug):
+    folder = project_path(slug); payload = request.get_json(silent=True)
+    if not folder or not isinstance(payload, dict): return jsonify(error="project object required"), 400
+    with project_lock(slug):
+        current = read_project(slug)
+        if current is None: return jsonify(error="project not found"), 404
+        if payload.get("rev") != current.get("rev"): return jsonify(error="project revision conflict", current_rev=current["rev"]), 409
+        saved = dict(payload); saved["sources"] = current.get("sources", []); saved["rev"] = current["rev"] + 1
+        saved["created_at"] = current.get("created_at"); saved["updated_at"] = datetime.now(timezone.utc).isoformat()
+        error = project_error(saved)
+        if error: return jsonify(error=error), 400
+        write_project(folder, saved)
+    return jsonify(project=saved, rev=saved["rev"])
+
+@app.delete("/api/projects/<slug>")
+@require_auth
+def delete_project(slug):
+    folder = project_path(slug)
+    if not folder or not folder.is_dir(): return jsonify(error="project not found"), 404
+    with project_rendering_lock:
+        if slug in project_rendering: return jsonify(error="project render is running"), 409
+    with project_lock(slug):
+        try: target = trash_move(folder, slug)
+        except OSError as exc: return jsonify(error=f"could not move project to trash: {exc}"), 500
+    return jsonify(trash_path=target)
+
+@app.post("/api/projects/<slug>/sources")
+@require_auth
+def add_project_sources(slug):
+    folder = project_path(slug); files = request.files.getlist("files") or request.files.getlist("file")
+    if not folder or not files: return jsonify(error="project and video files are required"), 400
+    with project_lock(slug):
+        p = read_project(slug)
+        if p is None: return jsonify(error="project not found"), 404
+        staged = []; created_paths = []
+        try:
+            for upload in files:
+                original = Path(upload.filename or "").name
+                ext = Path(original).suffix.lower()
+                if ext not in (".mp4", ".mov"): raise ValueError(f"{original}: only .mp4/.mov are supported")
+                nums = [int(re.search(r"\d+", s["id"]).group()) for s in p["sources"] if re.fullmatch(r"s\d+", s.get("id", ""))]
+                nums += [int(re.search(r"\d+", x["id"]).group()) for x in staged]
+                sid = f"s{max(nums, default=0)+1}"
+                dst = folder / "sources" / f"{sid}{ext}"; upload.save(dst); created_paths.append(dst)
+                probe = json.loads(run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "format=duration:stream=width,height:stream_tags=rotate:stream_side_data=rotation", "-of", "json", str(dst)]).stdout)
+                stream = next(x for x in probe.get("streams", []) if x.get("width") and x.get("height"))
+                width, height = video_dimensions(stream)
+                duration = float(probe["format"]["duration"]); thumb_rel = f"thumbs/{sid}.jpg"
+                thumb_path = folder / thumb_rel; run(["ffmpeg", "-y", "-ss", "1", "-i", str(dst), "-frames:v", "1", "-q:v", "2", str(thumb_path)]); created_paths.append(thumb_path)
+                staged.append({"id": sid, "file": f"sources/{sid}{ext}", "duration": round(duration, 3), "width": width, "height": height, "thumb": thumb_rel, "original_name": original})
+            p["sources"].extend(staged); p["rev"] += 1; p["updated_at"] = datetime.now(timezone.utc).isoformat(); write_project(folder, p)
+        except (ValueError, KeyError, StopIteration, subprocess.CalledProcessError, json.JSONDecodeError) as exc:
+            for path in created_paths:
+                if path.exists(): trash_move(path, f"{slug}-failed-upload")
+            if isinstance(exc, ValueError): return jsonify(error=str(exc)), 400
+            return jsonify(error=f"could not process source: {exc}"), 422
+    return jsonify(sources=p["sources"], rev=p["rev"]), 201
+
+@app.get("/api/projects/<slug>/thumbs/<thumb>")
+@require_auth
+def project_thumb(slug, thumb):
+    if not re.fullmatch(r"s\d+\.jpg", thumb): return jsonify(error="thumb not found"), 404
+    folder = project_path(slug); path = folder / "thumbs" / thumb if folder else None
+    return send_file(path, mimetype="image/jpeg") if path and path.is_file() else (jsonify(error="thumb not found"), 404)
+
+@app.get("/api/projects/<slug>/sources/<sid>")
+@require_auth
+def project_source(slug, sid):
+    p = read_project(slug); source = next((x for x in p.get("sources", []) if x.get("id") == sid), None) if p else None
+    if not source: return jsonify(error="source not found"), 404
+    folder = project_path(slug); path = folder / source["file"]
+    if not path.resolve().is_relative_to(folder.resolve()): return jsonify(error="source not found"), 404
+    return send_file(path, mimetype="video/quicktime" if path.suffix == ".mov" else "video/mp4", conditional=True)
+
+@app.delete("/api/projects/<slug>/sources/<sid>")
+@require_auth
+def delete_project_source(slug, sid):
+    folder = project_path(slug)
+    if not folder: return jsonify(error="project not found"), 404
+    with project_lock(slug):
+        p = read_project(slug)
+        if p is None: return jsonify(error="project not found"), 404
+        used = [x for x in p.get("scenes", []) if x.get("source") == sid]
+        if used: return jsonify(error="source is used by scenes", scenes=used), 409
+        src = next((x for x in p["sources"] if x.get("id") == sid), None)
+        if not src: return jsonify(error="source not found"), 404
+        try:
+            trash_move(folder / src["file"], f"{slug}-{sid}")
+            thumb_path = folder / src["thumb"]
+            if thumb_path.exists(): trash_move(thumb_path, f"{slug}-{sid}-thumb")
+        except OSError as exc: return jsonify(error=f"could not move source to trash: {exc}"), 500
+        p["sources"].remove(src); p["rev"] += 1; p["updated_at"] = datetime.now(timezone.utc).isoformat(); write_project(folder, p)
+    return jsonify(sources=p["sources"], rev=p["rev"])
 
 @app.get("/fonts/<path:name>")
 def fonts(name): return send_from_directory(ROOT / "fonts", name)
